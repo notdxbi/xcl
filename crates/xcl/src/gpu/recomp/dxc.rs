@@ -444,20 +444,76 @@ pub fn wait_for_memory(wanted: &Wanted) -> MemorySlot {
     }
 }
 
+/// The DXC workers' queue: a compile one of the title's threads waits for (`Job::wanted`) is
+/// taken ahead of the others, and the others (the preload's: pipelines of an earlier run made
+/// ahead of use) never take the last free worker. In one FIFO the bound pipeline's compile
+/// waited behind the preload's: with as many preload jobs as DXC workers, a title's draw – or its
+/// render thread building a compute pipeline – waited minutes for big programs no one needed yet.
+struct Queue {
+    jobs: std::sync::Mutex<(std::collections::VecDeque<Job>, usize)>,
+    cv: std::sync::Condvar,
+    workers: usize,
+}
+
+/// A job taken from `Queue` (the count of compiles no one waits for, until it is dropped).
+struct Taken<'a> {
+    q: &'a Queue,
+    unwanted: bool,
+}
+
+impl Drop for Taken<'_> {
+    fn drop(&mut self) {
+        if self.unwanted {
+            self.q.jobs.lock().unwrap().1 -= 1;
+            self.q.cv.notify_all();
+        }
+    }
+}
+
+impl Queue {
+    fn new(workers: usize) -> Self {
+        Queue { jobs: Default::default(), cv: Default::default(), workers }
+    }
+
+    fn push(&self, job: Job) {
+        self.jobs.lock().unwrap().0.push_back(job);
+        self.cv.notify_all();
+    }
+
+    /// The first job a title's thread waits for; else the oldest, while another worker stays
+    /// free for the next wanted one. (`wanted` is asked again every 50 ms: a queued preload job
+    /// becomes wanted when the title binds its pipeline.)
+    fn take(&self) -> (Job, Taken<'_>) {
+        // LOCAL A/B switch: `XCL_DXC_FIFO=1` takes jobs in order with no worker kept free
+        static FIFO: OnceLock<bool> = OnceLock::new();
+        let fifo = *FIFO.get_or_init(|| std::env::var("XCL_DXC_FIFO").is_ok_and(|v| v.trim() == "1"));
+        let mut g = self.jobs.lock().unwrap();
+        loop {
+            let (jobs, unwanted) = &mut *g;
+            if fifo && !jobs.is_empty() {
+                return (jobs.pop_front().unwrap(), Taken { q: self, unwanted: false });
+            }
+            if let Some(k) = jobs.iter().position(|j| (j.wanted)()) {
+                return (jobs.remove(k).unwrap(), Taken { q: self, unwanted: false });
+            }
+            if !jobs.is_empty() && (*unwanted + 1 < self.workers || self.workers == 1) {
+                *unwanted += 1;
+                return (jobs.pop_front().unwrap(), Taken { q: self, unwanted: true });
+            }
+            g = self.cv.wait_timeout(g, std::time::Duration::from_millis(50)).unwrap().0;
+        }
+    }
+}
+
 /// DXC workers (`compile_threads`, each with its own compiler and a `DXC_STACK` stack), started
 /// on first use; callers wait for their job.
-fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
-    static POOL: OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>> = OnceLock::new();
+fn pool() -> &'static Queue {
+    static POOL: OnceLock<&'static Queue> = OnceLock::new();
     POOL.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<Job>();
-        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
-        for k in 0..compile_threads() {
-            let rx = rx.clone();
+        let q: &'static Queue = Box::leak(Box::new(Queue::new(compile_threads())));
+        for k in 0..q.workers {
             let _ = std::thread::Builder::new().name(format!("xcl-dxc-{k}")).stack_size(DXC_STACK).spawn(move || loop {
-                let job = match rx.lock().unwrap().recv() {
-                    Ok(j) => j,
-                    Err(_) => return,
-                };
+                let (job, _taken) = q.take();
                 let _slot = wait_for_memory(&job.wanted);
                 let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra)))
@@ -465,7 +521,7 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
                 let _ = job.reply.send(r);
             });
         }
-        std::sync::Mutex::new(tx)
+        q
     })
 }
 
@@ -473,7 +529,7 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
 pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let (reply, rx) = std::sync::mpsc::channel();
     let job = Job { src: src.into(), entry: entry.into(), profile: profile.into(), extra: extra.iter().map(|s| s.to_string()).collect(), reply, wanted: crate::hle::d3d12x::pso_async::wanted_here() };
-    pool().lock().unwrap().send(job).map_err(|_| "DXC: no compile threads".to_string())?;
+    pool().push(job);
     rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
 }
 
@@ -1247,5 +1303,44 @@ mod cache_tests {
             release_tx.send(()).unwrap();
             second_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         });
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    fn job(name: &str, wanted: Arc<AtomicBool>) -> Job {
+        let (reply, _rx) = std::sync::mpsc::channel();
+        Job { src: String::new(), entry: name.into(), profile: String::new(), extra: Vec::new(), reply, wanted: Box::new(move || wanted.load(Ordering::Relaxed)) }
+    }
+
+    #[test]
+    fn a_wanted_job_is_taken_ahead_and_one_worker_stays_free_for_it() {
+        let q = Queue::new(2);
+        let no = Arc::new(AtomicBool::new(false));
+        let later = Arc::new(AtomicBool::new(false));
+        q.push(job("preload-a", no.clone()));
+        q.push(job("preload-b", no.clone()));
+        q.push(job("bound", later.clone()));
+        // not wanted (yet): oldest first
+        let (a, ta) = q.take();
+        assert_eq!(a.entry, "preload-a");
+        // the second worker is not given another preload job while the first runs
+        let q2 = &q;
+        let waiting = std::thread::scope(|sc| {
+            let h = sc.spawn(move || q2.take().0.entry);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert!(!h.is_finished());
+            // a title's thread starts waiting for a queued job: the free worker takes it
+            later.store(true, Ordering::Relaxed);
+            h.join().unwrap()
+        });
+        assert_eq!(waiting, "bound");
+        // once the first preload job is done, the next one goes
+        drop(ta);
+        assert_eq!(q.take().0.entry, "preload-b");
     }
 }
